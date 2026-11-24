@@ -72,7 +72,7 @@ const $ = id => document.getElementById(id);
 const status = s => ($('status').textContent = s);
 const SR = 48000;
 // Pegá acá la URL que imprimió `modal deploy` para que la demo funcione sin configurar nada
-const DEFAULT_ENDPOINT = '';
+const DEFAULT_ENDPOINT = 'https://ignaciojsoler--ai-demos-voice-voice-web.us-east.modal.run';
 
 // endpoint recordado entre visitas (conveniencia local)
 try { $('endpoint').value = DEFAULT_ENDPOINT || localStorage.getItem('voiceEndpoint') || ''; } catch { $('endpoint').value = DEFAULT_ENDPOINT; }
