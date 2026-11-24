@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Booth — studio voice, anywhere</title>
+<style>
+  body{font:14px system-ui,sans-serif;margin:20px;background:#111;color:#eee;max-width:900px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:10px 0}
+  label{display:flex;gap:6px;align-items:center}
+  button{padding:6px 12px;cursor:pointer}
+  input[type=text]{background:#1c1c1c;color:#eee;border:1px solid #333;padding:6px;width:420px;font:inherit}
+  fieldset{border:1px solid #333;margin:12px 0;padding:10px 14px}
+  legend{color:#aaa}
+  #ab button.on{background:#ffe14d;color:#111}
+  .muted{color:#999}
+  .brand{display:flex;align-items:baseline;gap:10px;margin:0 0 6px}
+  .brand b{font-size:28px;letter-spacing:-.02em;color:#ffe14d}
+  .brand span{color:#bbb}
+  audio{width:100%;margin-top:8px}
+  a{color:#8cf}
+</style>
+</head>
+<body>
+<header class="brand"><b>Booth</b><span>studio voice, anywhere</span></header>
+<p class="muted" style="margin-top:0">Subí un audio o video grabado con el celular: la IA saca el ruido y la masterización le da sonido de podcast. Compará antes y después.</p>
+
+<details id="cfg">
+  <summary class="muted">Configuración</summary>
+  <div class="row">
+    <label>Endpoint de Modal <input type="text" id="endpoint" placeholder="https://<tu-usuario>--ai-demos-voice-voice-web.modal.run"></label>
+    <button id="ping">Probar conexión</button>
+  </div>
+</details>
+<p id="server" class="muted"></p>
+
+<div class="row">
+  <input type="file" id="file" accept="audio/*,video/*">
+  <span id="status" class="muted">Subí un audio o video con voz (máx. 3 min)</span>
+</div>
+
+<fieldset>
+  <legend>Proceso</legend>
+  <div class="row">
+    <label><input type="checkbox" id="useAI" checked> Limpieza con IA (MossFormer2, en Modal)</label>
+    <label><input type="checkbox" id="usePod" checked> Cadena "podcast" (en el navegador)</label>
+  </div>
+  <div class="row">
+    <label>Presencia <input type="range" id="presence" min="0" max="6" step="0.5" value="3"> <span id="presenceV"></span></label>
+    <label>Compresión <input type="range" id="comp" min="1" max="8" step="0.5" value="3"> <span id="compV"></span></label>
+    <label>Calidez <input type="range" id="warm" min="-3" max="3" step="0.5" value="1"> <span id="warmV"></span></label>
+  </div>
+  <div class="row">
+    <button id="run" disabled>Procesar</button>
+    <small class="muted">Los sliders se aplican sin volver a llamar a la IA: ajustá y apretá "Re-masterizar".</small>
+    <button id="remaster" disabled>Re-masterizar</button>
+  </div>
+</fieldset>
+
+<div id="ab" class="row">
+  <b>Escuchar:</b>
+  <button data-v="orig" class="on">Original</button>
+  <button data-v="ai" disabled>Solo IA</button>
+  <button data-v="final" disabled>Final</button>
+  <a id="dl" hidden>Descargar esta versión (.wav)</a>
+</div>
+<audio id="player" controls></audio>
+
+<script>
+{
+const $ = id => document.getElementById(id);
+const status = s => ($('status').textContent = s);
+const SR = 48000;
+// Pegá acá la URL que imprimió `modal deploy` para que la demo funcione sin configurar nada
+const DEFAULT_ENDPOINT = '';
+
+// endpoint recordado entre visitas (conveniencia local)
+try { $('endpoint').value = DEFAULT_ENDPOINT || localStorage.getItem('voiceEndpoint') || ''; } catch { $('endpoint').value = DEFAULT_ENDPOINT; }
+if (!$('endpoint').value) $('cfg').open = true;
+$('endpoint').onchange = () => { try { localStorage.setItem('voiceEndpoint', $('endpoint').value.trim()); } catch {} };
+const endpoint = () => $('endpoint').value.trim().replace(/\/+$/, '');
+
+$('ping').onclick = async () => {
+  status('Probando… (si el contenedor estaba apagado puede tardar ~30 s)');
+  try {
+    const r = await fetch(endpoint() + '/');
+    const d = await r.json();
+    status(d.ok ? `Conectado: ${d.model}` : 'Respuesta inesperada');
+  } catch (e) { status('No conecta: ' + e.message); }
+};
+
+// ---------- utilidades de audio ----------
+async function decodeToMono(arrayBuffer) {
+  const ctx = new AudioContext();
+  const decoded = await ctx.decodeAudioData(arrayBuffer);
+  ctx.close();
+  const off = new OfflineAudioContext(1, Math.ceil(decoded.duration * SR), SR);
+  const src = off.createBufferSource();
+  src.buffer = decoded; src.connect(off.destination); src.start();
+  return off.startRendering();                 // AudioBuffer mono 48 kHz
+}
+
+function toWav(buffer) {
+  const data = buffer.getChannelData(0), sr = buffer.sampleRate;
+  const b = new ArrayBuffer(44 + data.length * 2), v = new DataView(b);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + data.length * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, data.length * 2, true);
+  for (let i = 0; i < data.length; i++) {
+    const s = Math.max(-1, Math.min(1, data[i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([b], { type: 'audio/wav' });
+}
+
+// ---------- cadena "podcast" ----------
+// HPF 80 Hz → recorte de "barro" 300 Hz → calidez (low shelf) → presencia 4 kHz → aire 10 kHz
+// → compresor → normalización a ~-18 dBFS RMS → limitador de picos a -1 dBFS
+async function podcastChain(input) {
+  const off = new OfflineAudioContext(1, input.length, input.sampleRate);
+  const src = off.createBufferSource(); src.buffer = input;
+  const biquad = (type, f, gain = 0, Q = 0.7) => { const n = off.createBiquadFilter(); n.type = type; n.frequency.value = f; n.gain.value = gain; n.Q.value = Q; return n; };
+  const hpf = biquad('highpass', 80);
+  const mud = biquad('peaking', 300, -2, 1);
+  const warm = biquad('lowshelf', 180, +$('warm').value);
+  const presence = biquad('peaking', 4000, +$('presence').value, 1);
+  const air = biquad('highshelf', 10000, 2);
+  const comp = off.createDynamicsCompressor();
+  comp.threshold.value = -26; comp.knee.value = 6; comp.ratio.value = +$('comp').value;
+  comp.attack.value = 0.005; comp.release.value = 0.15;
+  src.connect(hpf).connect(mud).connect(warm).connect(presence).connect(air).connect(comp).connect(off.destination);
+  src.start();
+  const out = await off.startRendering();
+
+  // normalización de nivel (aprox. RMS, no LUFS real) + limitador simple
+  const d = out.getChannelData(0);
+  let sum = 0; for (const x of d) sum += x * x;
+  const rms = Math.sqrt(sum / d.length) || 1e-9;
+  const gain = Math.pow(10, -18 / 20) / rms;
+  const ceiling = Math.pow(10, -1 / 20);
+  for (let i = 0; i < d.length; i++) {
+    let x = d[i] * gain;
+    const a = Math.abs(x);
+    if (a > ceiling * 0.8) x = Math.sign(x) * (ceiling * 0.8 + (ceiling * 0.2) * Math.tanh((a - ceiling * 0.8) / (ceiling * 0.2)));   // soft-knee
+    d[i] = x;
+  }
+  return out;
+}
+
+// ---------- estado y flujo ----------
+let original = null, aiOut = null, finalOut = null;
+const urls = {};
+function setVersion(name, buffer) {
+  if (urls[name]) URL.revokeObjectURL(urls[name]);
+  urls[name] = URL.createObjectURL(toWav(buffer));
+  document.querySelector(`#ab [data-v="${name}"]`).disabled = false;
+}
+
+$('file').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  status('Decodificando…');
+  try {
+    original = await decodeToMono(await f.arrayBuffer());
+    if (original.duration > 180) { status(`Dura ${Math.round(original.duration)} s; el máximo es 180 s`); original = null; return; }
+    aiOut = finalOut = null;
+    ['ai', 'final'].forEach(v => (document.querySelector(`#ab [data-v="${v}"]`).disabled = true));
+    $('remaster').disabled = true;
+    setVersion('orig', original); select('orig');
+    $('run').disabled = false;
+    status(`${original.duration.toFixed(1)} s cargados`);
+  } catch (err) { status('No se pudo decodificar: ' + err.message); }
+};
+
+$('run').onclick = async () => {
+  if (!original) return;
+  $('run').disabled = true;
+  try {
+    if ($('useAI').checked) {
+      if (!endpoint()) throw new Error('Pegá el endpoint de Modal');
+      status('Limpiando con IA… (el primer pedido tras un rato sin uso tarda más: arranca el contenedor)');
+      const t = performance.now();
+      const r = await fetch(endpoint() + '/enhance', { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: toWav(original) });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+      aiOut = await decodeToMono(await r.arrayBuffer());
+      setVersion('ai', aiOut);
+      status(`IA lista en ${((performance.now() - t) / 1000).toFixed(1)} s`);
+    } else {
+      aiOut = original;
+    }
+    await remaster();
+    select('final');
+  } catch (e) { status('Error: ' + e.message); }
+  $('run').disabled = false;
+};
+
+async function remaster() {
+  if (!aiOut) return;
+  finalOut = $('usePod').checked ? await podcastChain(aiOut) : aiOut;
+  setVersion('final', finalOut);
+  $('remaster').disabled = false;
+}
+$('remaster').onclick = async () => { const t = $('player').currentTime; await remaster(); select('final', t); };
+
+// A/B: cambiar de versión manteniendo la posición de reproducción
+function select(name, keepTime) {
+  const p = $('player'), t = keepTime ?? p.currentTime, playing = !p.paused;
+  document.querySelectorAll('#ab button').forEach(b => b.classList.toggle('on', b.dataset.v === name));
+  p.src = urls[name];
+  $('dl').href = urls[name];
+  $('dl').download = { orig: 'ejemplo-original.wav', ai: 'ejemplo-ia.wav', final: 'voz-podcast.wav' }[name];
+  $('dl').hidden = false;
+  p.onloadedmetadata = () => { p.currentTime = Math.min(t, p.duration || t); if (playing) p.play(); };
+}
+$('ab').addEventListener('click', e => { const v = e.target.dataset?.v; if (v && !e.target.disabled) select(v); });
+
+// ---------- precalentar el servidor apenas se abre la página ----------
+async function prewarm() {
+  if (!endpoint()) return;
+  $('server').textContent = '⏳ Despertando el servidor de IA en segundo plano…';
+  const t = performance.now();
+  try {
+    const r = await fetch(endpoint() + '/');
+    if (!r.ok) throw new Error(r.status);
+    const s = (performance.now() - t) / 1000;
+    $('server').textContent = `✅ Servidor de IA listo${s > 3 ? ` (tardó ${s.toFixed(0)} s en despertar)` : ''}`;
+  } catch { $('server').textContent = '⚠️ No se pudo contactar el servidor de IA'; }
+}
+
+// ---------- ejemplo precargado: se escucha al instante, sin tocar el servidor ----------
+async function loadExample() {
+  try {
+    const [o, a] = await Promise.all(['samples/ejemplo-original.wav', 'samples/ejemplo-ia.wav'].map(async u => {
+      const r = await fetch(u); if (!r.ok) throw 0; return decodeToMono(await r.arrayBuffer());
+    }));
+    original = o; aiOut = a;
+    setVersion('orig', original); setVersion('ai', aiOut);
+    await remaster();
+    select('final');
+    $('run').disabled = false;
+    status('Ejemplo cargado: compará Original / Solo IA / Final, o subí tu propio audio.');
+  } catch { /* sin ejemplo: se usa el flujo normal */ }
+}
+
+loadExample();
+prewarm();
+
+for (const id of ['presence', 'comp', 'warm']) {
+  const show = () => ($(id + 'V').textContent = id === 'comp' ? `${$(id).value}:1` : `${$(id).value} dB`);
+  $(id).addEventListener('input', show); show();
+}
+}
+</script>
+</body>
+</html>
